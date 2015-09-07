@@ -39,7 +39,7 @@ struct st_h2o_mruby_internal_context_t {
 typedef struct st_h2o_mruby_internal_context_t h2o_mruby_internal_context_t;
 
 /* handler/mruby.c */
-struct RProc *h2o_mruby_compile_code(mrb_state *mrb_state, h2o_mruby_config_vars_t *config, char *errbuf);
+mrb_value h2o_mruby_compile_code(mrb_state *mrb_state, h2o_mruby_config_vars_t *config, char *errbuf);
 h2o_mruby_handler_t *h2o_mruby_register(h2o_pathconf_t *pathconf, h2o_mruby_config_vars_t *config);
 void h2o_mruby_fixup_and_send(h2o_req_t *req, const char *body, size_t len);
 

@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <mruby.h>
 #include <mruby/proc.h>
+#include <mruby/array.h>
 #include <mruby/compile.h>
 #include <mruby/string.h>
 #include "h2o.h"
@@ -33,12 +34,12 @@ struct st_h2o_mruby_context_t {
     h2o_mruby_handler_t *handler;
     mrb_state *mrb;
     /* TODO: add other hook code */
-    struct RProc *proc;
+    mrb_value proc;
 };
 
 typedef struct st_h2o_mruby_context_t h2o_mruby_context_t;
 
-struct RProc *h2o_mruby_compile_code(mrb_state *mrb, h2o_mruby_config_vars_t *config, char *errbuf)
+mrb_value h2o_mruby_compile_code(mrb_state *mrb, h2o_mruby_config_vars_t *config, char *errbuf)
 {
     mrbc_context *cxt;
     struct mrb_parser_state *parser;
@@ -72,10 +73,23 @@ struct RProc *h2o_mruby_compile_code(mrb_state *mrb, h2o_mruby_config_vars_t *co
         abort();
     }
 
+    mrb_value result = mrb_run(mrb, proc, mrb_top_self(mrb));
+    if (mrb->exc) {
+        mrb_value obj = mrb_funcall(mrb, mrb_obj_value(mrb->exc), "inspect", 0);
+        struct RString *error = mrb_str_ptr(obj);
+        snprintf(errbuf, 256, "%s", error->as.heap.ptr);
+        mrb->exc = 0;
+        result = mrb_nil_value();
+        goto Exit;
+    } else if (mrb_nil_p(result)) {
+        snprintf(errbuf, 256, "returned value is not callable");
+        goto Exit;
+    }
+
 Exit:
     mrb_parser_free(parser);
     mrbc_context_free(mrb, cxt);
-    return proc;
+    return result;
 }
 
 static void on_context_init(h2o_handler_t *_handler, h2o_context_t *ctx)
@@ -92,7 +106,10 @@ static void on_context_init(h2o_handler_t *_handler, h2o_context_t *ctx)
     }
     h2o_mrb_class_init(handler_ctx->mrb);
     /* compile code (must be done for each thread) */
+    int arena = mrb_gc_arena_save(handler_ctx->mrb);
     handler_ctx->proc = h2o_mruby_compile_code(handler_ctx->mrb, &handler->config, NULL);
+    mrb_gc_arena_restore(handler_ctx->mrb, arena);
+    mrb_gc_protect(handler_ctx->mrb, handler_ctx->proc);
 
     h2o_context_set_handler_context(ctx, &handler->super, handler_ctx);
 }
@@ -118,6 +135,14 @@ static void on_handler_dispose(h2o_handler_t *_handler)
     free(handler);
 }
 
+static void report_exception(h2o_req_t *req, mrb_state *mrb)
+{
+    mrb_value obj = mrb_funcall(mrb, mrb_obj_value(mrb->exc), "inspect", 0);
+    struct RString *error = mrb_str_ptr(obj);
+    h2o_req_log_error(req, H2O_MRUBY_MODULE_NAME, "%s: mruby raised: %s\n", H2O_MRUBY_MODULE_NAME, error->as.heap.ptr);
+    mrb->exc = NULL;
+}
+
 static int on_req(h2o_handler_t *_handler, h2o_req_t *req)
 {
     h2o_mruby_handler_t *handler = (void *)_handler;
@@ -126,12 +151,6 @@ static int on_req(h2o_handler_t *_handler, h2o_req_t *req)
     mrb_state *mrb = handler_ctx->mrb;
     mrb_value result;
     mrb_int ai;
-
-    if (mrb == NULL || handler_ctx->proc == NULL) {
-        fprintf(stderr, "%s: mruby core got unexpected error\n", H2O_MRUBY_MODULE_NAME);
-        h2o_send_error(req, 500, "Internal Server Error", "Internal Server Error", 0);
-        return 0;
-    }
 
     ai = mrb_gc_arena_save(mrb);
 
@@ -142,29 +161,49 @@ static int on_req(h2o_handler_t *_handler, h2o_req_t *req)
     mrb->ud = (void *)mruby_ctx;
     req->res.status = 0;
 
-    result = mrb_run(mrb, handler_ctx->proc, mrb_top_self(mrb));
+    result = mrb_funcall(mrb, handler_ctx->proc, "call", 1, mrb_nil_value());
 
     if (mrb->exc) {
-        mrb_value obj = mrb_funcall(mrb, mrb_obj_value(mrb->exc), "inspect", 0);
-        struct RString *error = mrb_str_ptr(obj);
-        fprintf(stderr, "%s: mruby raised: %s\n", H2O_MRUBY_MODULE_NAME, error->as.heap.ptr);
-        mrb->exc = 0;
-        if (mruby_ctx->state == H2O_MRUBY_STATE_UNDETERMINED) {
-            h2o_send_error(req, 500, "Internal Server Error", "Internal Server Error", 0);
-            mruby_ctx->state = H2O_MRUBY_STATE_RESPONSE_SENT;
+        report_exception(req, mrb);
+        goto SendInternalError;
+    } else if (!mrb_array_p(result)) {
+        fprintf(stderr, "%s: mruby handler did not return an array\n", H2O_MRUBY_MODULE_NAME);
+        goto SendInternalError;
+    } else {
+        mrb_value v = mrb_to_int(mrb, mrb_ary_entry(result, 0));
+        if (mrb->exc) {
+            report_exception(req, mrb);
+            goto SendInternalError;
         }
-    } else if (!mrb_nil_p(result)) {
-        if (mruby_ctx->state == H2O_MRUBY_STATE_UNDETERMINED) {
-            /* convert to string and send */
-            result = mrb_str_to_str(mrb, result);
-            h2o_mruby_fixup_and_send(req, h2o_strdup(&req->pool, RSTRING_PTR(result), RSTRING_LEN(result)).base,
-                                     RSTRING_LEN(result));
-            mruby_ctx->state = H2O_MRUBY_STATE_RESPONSE_SENT;
+        v = mrb_ary_entry(result, 1);
+        if (!mrb_hash_p(v)) {
+            h2o_req_log_error(req, "%s: 2nd element of the response is not a hash", H2O_MRUBY_MODULE_NAME);
+            goto SendInternalError;
         }
+        v = mrb_ary_entry(result, 2);
+        if (!mrb_array_p(v)) {
+            h2o_req_log_error(req, "%s: 3rd element of the response is not an array", H2O_MRUBY_MODULE_NAME);
+            goto SendInternalError;
+        }
+        v = mrb_str_to_str(mrb, mrb_ary_entry(v, 0));
+        if (mrb->exc) {
+            report_exception(req, mrb);
+            goto SendInternalError;
+        }
+        h2o_mruby_fixup_and_send(req, h2o_strdup(&req->pool, RSTRING_PTR(v), RSTRING_LEN(v)).base, RSTRING_LEN(v));
+        mruby_ctx->state = H2O_MRUBY_STATE_RESPONSE_SENT;
     }
 
     mrb_gc_arena_restore(mrb, ai);
     return mruby_ctx->state == H2O_MRUBY_STATE_RESPONSE_SENT ? 0 : -1;
+
+SendInternalError:
+    if (mruby_ctx->state == H2O_MRUBY_STATE_UNDETERMINED) {
+        h2o_send_error(req, 500, "Internal Server Error", "Internal Server Error", 0);
+        mruby_ctx->state = H2O_MRUBY_STATE_RESPONSE_SENT;
+    }
+    mrb_gc_arena_restore(mrb, ai);
+    return 0;
 }
 
 void h2o_mruby_fixup_and_send(h2o_req_t *req, const char *body, size_t len)
